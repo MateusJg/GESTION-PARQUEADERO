@@ -1,0 +1,258 @@
+-- CREACIÓN DE BASE DE DATOS
+CREATE DATABASE IF NOT EXISTS parqueadero
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_general_ci;
+USE parqueadero;
+
+-- TABLA: Tipos de Vehículos (definición de cupos máximos)
+DROP TABLE IF EXISTS tipos_vehiculos;
+CREATE TABLE tipos_vehiculos (
+    tipo_id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(50) NOT NULL,
+    cupos_maximos INT NOT NULL
+);
+
+-- Insertar cupos iniciales
+INSERT INTO tipos_vehiculos (nombre, cupos_maximos) VALUES
+('Carros', 10),
+('Motos / eMotos', 200),
+('Bicis / Patinetas', 100);
+
+-- TABLA: Vehículos (registro con código QR)
+DROP TABLE IF EXISTS vehiculos;
+CREATE TABLE vehiculos (
+    vehiculo_id INT AUTO_INCREMENT PRIMARY KEY,
+    propietario VARCHAR(100) NOT NULL,
+    documento VARCHAR(20) NOT NULL, -- También puede llamarse identificacion
+    marca VARCHAR(50),
+    color VARCHAR(30),
+    placa VARCHAR(20) UNIQUE NOT NULL,
+    tipo_id INT NOT NULL,
+    codigo_qr VARCHAR(191) UNIQUE, -- identificador único para QR
+    fecha_registro DATETIME DEFAULT CURRENT_TIMESTAMP,
+    activo BOOLEAN DEFAULT TRUE,
+    FOREIGN KEY (tipo_id) REFERENCES tipos_vehiculos(tipo_id)
+);
+
+-- Insertar vehículos de ejemplo
+INSERT INTO vehiculos (propietario, documento, marca, color, placa, tipo_id, codigo_qr, activo) VALUES
+('Juan Pérez', '123456789', 'Chevrolet', 'Rojo', 'ABC123', 1, 'QR001', 1),
+('Ana Gómez', '987654321', 'Yamaha', 'Negro', 'XYZ789', 2, 'QR002', 1),
+('Luis Torres', '555666777', 'BMX', 'Azul', 'BICI01', 3, 'QR003', 1);
+
+
+-- TABLA: Operarios y Administradores
+DROP TABLE IF EXISTS operarios;
+CREATE TABLE operarios (
+    operario_id INT AUTO_INCREMENT PRIMARY KEY,
+    usuario VARCHAR(50) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    telefono VARCHAR(20),
+    rol ENUM('admin', 'operario') NOT NULL DEFAULT 'operario',
+    fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
+    activo TINYINT(1) NOT NULL DEFAULT 1
+);
+
+-- Insertar administrador por defecto
+INSERT INTO operarios (usuario, password, telefono, rol)
+VALUES ('Administrador', SHA2('admin123', 256), '0000000000', 'admin');
+
+-- Insertar operario de ejemplo
+INSERT INTO operarios (usuario, password, telefono, rol)
+VALUES ('operario1', SHA2('op123', 256), '3001234567', 'operario');
+
+-- TABLA: Accesos (historial de ingresos/salidas)
+DROP TABLE IF EXISTS accesos;
+CREATE TABLE accesos (
+    acceso_id INT AUTO_INCREMENT PRIMARY KEY,
+    vehiculo_id INT NOT NULL,
+    fecha_ingreso DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_salida DATETIME,
+    registrado_por INT, -- operario que hizo el registro
+    observaciones TEXT, -- Campo adicional para notas
+    FOREIGN KEY (vehiculo_id) REFERENCES vehiculos(vehiculo_id),
+    FOREIGN KEY (registrado_por) REFERENCES operarios(operario_id)
+);
+
+-- VISTA: Cupos disponibles en tiempo real
+DROP VIEW IF EXISTS vista_cupos_disponibles;
+CREATE VIEW vista_cupos_disponibles AS
+SELECT 
+    tv.tipo_id,
+    tv.nombre AS tipo_vehiculo,
+    tv.cupos_maximos,
+    COALESCE(ocupados.vehiculos_dentro, 0) AS cupos_ocupados,
+    (tv.cupos_maximos - COALESCE(ocupados.vehiculos_dentro, 0)) AS cupos_disponibles
+FROM tipos_vehiculos tv
+LEFT JOIN (
+    SELECT 
+        v.tipo_id,
+        COUNT(a.acceso_id) as vehiculos_dentro
+    FROM vehiculos v
+    INNER JOIN accesos a ON a.vehiculo_id = v.vehiculo_id
+    WHERE a.fecha_salida IS NULL -- Solo vehículos que están dentro
+    GROUP BY v.tipo_id
+) ocupados ON ocupados.tipo_id = tv.tipo_id;
+
+-- VISTA: Consulta completa de accesos (para la interfaz de imagen 4)
+DROP VIEW IF EXISTS vista_consulta_accesos;
+CREATE VIEW vista_consulta_accesos AS
+SELECT 
+    a.acceso_id,
+    DATE(a.fecha_ingreso) as fecha_ingreso,
+    DATE(a.fecha_salida) as fecha_salida,
+    v.documento,
+    v.propietario,
+    tv.nombre as tipo_vehiculo,
+    v.marca,
+    v.color,
+    v.placa,
+    CASE 
+        WHEN a.fecha_salida IS NULL THEN 'DENTRO'
+        ELSE 'SALIÓ'
+    END as estado
+FROM accesos a
+INNER JOIN vehiculos v ON a.vehiculo_id = v.vehiculo_id
+INNER JOIN tipos_vehiculos tv ON v.tipo_id = tv.tipo_id
+ORDER BY a.fecha_ingreso DESC;
+
+-- VISTA: Vehículos actualmente en el parqueadero
+DROP VIEW IF EXISTS vista_vehiculos_dentro;
+CREATE VIEW vista_vehiculos_dentro AS
+SELECT 
+    v.vehiculo_id,
+    v.propietario,
+    v.documento,
+    v.placa,
+    tv.nombre as tipo_vehiculo,
+    v.marca,
+    v.color,
+    a.fecha_ingreso,
+    TIMESTAMPDIFF(HOUR, a.fecha_ingreso, NOW()) as horas_dentro
+FROM vehiculos v
+INNER JOIN accesos a ON a.vehiculo_id = v.vehiculo_id
+INNER JOIN tipos_vehiculos tv ON v.tipo_id = tv.tipo_id
+WHERE a.fecha_salida IS NULL
+ORDER BY a.fecha_ingreso DESC;
+
+-- PROCEDIMIENTOS ALMACENADOS PARA LAS OPERACIONES PRINCIPALES
+
+-- Procedimiento para registrar ingreso
+DELIMITER //
+CREATE PROCEDURE sp_registrar_ingreso(
+    IN p_codigo_qr VARCHAR(191),
+    IN p_operario_id INT
+)
+BEGIN
+    DECLARE v_vehiculo_id INT;
+    DECLARE v_ya_dentro INT DEFAULT 0;
+    DECLARE v_cupos_disponibles INT;
+    DECLARE v_tipo_id INT;
+    
+    -- Obtener vehículo por código QR
+    SELECT vehiculo_id, tipo_id INTO v_vehiculo_id, v_tipo_id
+    FROM vehiculos WHERE codigo_qr = p_codigo_qr AND activo = TRUE;
+    
+    IF v_vehiculo_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Vehículo no encontrado o inactivo';
+    END IF;
+    
+    -- Verificar si ya está dentro
+    SELECT COUNT(*) INTO v_ya_dentro
+    FROM accesos 
+    WHERE vehiculo_id = v_vehiculo_id AND fecha_salida IS NULL;
+    
+    IF v_ya_dentro > 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El vehículo ya se encuentra dentro del parqueadero';
+    END IF;
+    
+    -- Verificar cupos disponibles
+    SELECT cupos_disponibles INTO v_cupos_disponibles
+    FROM vista_cupos_disponibles
+    WHERE tipo_id = v_tipo_id;
+    
+    IF v_cupos_disponibles <= 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'No hay cupos disponibles para este tipo de vehículo';
+    END IF;
+    
+    -- Registrar ingreso
+    INSERT INTO accesos (vehiculo_id, registrado_por)
+    VALUES (v_vehiculo_id, p_operario_id);
+    
+    SELECT 'Ingreso registrado exitosamente' as mensaje;
+END //
+
+-- Procedimiento para registrar salida
+CREATE PROCEDURE sp_registrar_salida(
+    IN p_codigo_qr VARCHAR(191),
+    IN p_operario_id INT
+)
+BEGIN
+    DECLARE v_vehiculo_id INT;
+    DECLARE v_acceso_id INT;
+    
+    -- Obtener vehículo por código QR
+    SELECT vehiculo_id INTO v_vehiculo_id
+    FROM vehiculos WHERE codigo_qr = p_codigo_qr AND activo = TRUE;
+    
+    IF v_vehiculo_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Vehículo no encontrado o inactivo';
+    END IF;
+    
+    -- Obtener acceso activo
+    SELECT acceso_id INTO v_acceso_id
+    FROM accesos 
+    WHERE vehiculo_id = v_vehiculo_id AND fecha_salida IS NULL
+    LIMIT 1;
+    
+    IF v_acceso_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El vehículo no se encuentra dentro del parqueadero';
+    END IF;
+    
+    -- Registrar salida
+    UPDATE accesos 
+    SET fecha_salida = NOW()
+    WHERE acceso_id = v_acceso_id;
+    
+    SELECT 'Salida registrada exitosamente' as mensaje;
+END //
+DELIMITER ;
+
+-- INSERTAR DATOS DE EJEMPLO
+INSERT INTO vehiculos (propietario, documento, telefono, marca, color, placa, tipo_id, codigo_qr) VALUES
+('Juan Pérez', '12345678', '3001234567', 'Toyota', 'Rojo', 'ABC123', 1, 'QR001'),
+('María García', '87654321', '3009876543', 'Honda', 'Azul', 'XYZ789', 2, 'QR002'),
+('Carlos López', '11111111', '3005555555', 'Trek', 'Verde', 'BIC001', 3, 'QR003');
+
+-- CONSULTAS DE EJEMPLO PARA VERIFICAR CONCORDANCIA
+
+-- 1. Verificar login (Imagen 1)
+SELECT usuario, rol FROM operarios WHERE activo = TRUE;
+
+-- 2. Consultar cupos disponibles (Imagen 2)
+SELECT * FROM vista_cupos_disponibles;
+
+-- 3. Listar vehículos para administración (Imagen 3)
+SELECT 
+    documento,
+    propietario,
+    tv.nombre as tipo_vehiculo,
+    marca,
+    color,
+    placa
+FROM vehiculos v
+INNER JOIN tipos_vehiculos tv ON v.tipo_id = tv.tipo_id
+WHERE v.activo = TRUE;
+
+-- 4. Consulta de accesos (Imagen 4)
+SELECT 
+    fecha_ingreso,
+    fecha_salida,
+    documento,
+    propietario,
+    tipo_vehiculo,
+    marca,
+    color,
+    placa
+FROM vista_consulta_accesos
+LIMIT 10;
